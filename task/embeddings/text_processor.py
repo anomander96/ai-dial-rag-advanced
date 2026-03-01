@@ -29,27 +29,73 @@ class TextProcessor:
             password=self.db_config['password']
         )
 
-    #TODO:
-    # provide method `process_text_file` that will:
-    #   - apply file name, chunk size, overlap, dimensions and bool of the table should be truncated
-    #   - truncate table with vectors if needed
-    #   - load content from file and generate chunks (in `utils.text` present `chunk_text` that will help do that)
-    #   - generate embeddings from chunks
-    #   - save (insert) embeddings and chunks to DB
-    #       hint 1: embeddings should be saved as string list
-    #       hint 2: embeddings string list should be casted to vector ({embeddings}::vector)
+    def process_text_file(self, file_name: str, chunk_size: int, overlap: int, dimensions: int, truncate: bool):
+        with self._get_connection() as conn:
+            with conn.cursor() as cursor:
+                if truncate:
+                    cursor.execute("TRUNCATE TABLE vectors")
+                    print("🗑️ Table truncated")
+
+                # load file content
+                with open(file_name, 'r', encoding = 'utf-8') as f:
+                    content = f.read()
+                
+                # split text into chunks
+                chunks = chunk_text(content, chunk_size = chunk_size, overlap = overlap)
+
+                # generate embeddings
+                embeddings = self.embeddings_client.get_embeddings(
+                    input_texts = chunks,
+                    dimensions = dimensions
+                )
+                print(f"🔢 Generated {len(embeddings)} embeddings")
+
+                # insert chunk and it embeddings into DB
+                for i, chunk in enumerate(chunks):
+                    embedding_vector = embeddings[i]
+
+                    # convert to string
+                    embedding_str = str(embedding_vector)
+
+                    cursor.execute(
+                        "INSERT INTO vectors(text, embedding) VALUES (%s, %s::vector)",
+                        (chunk, embedding_str)
+                    )
+
+                # commit transaction
+                conn.commit()
+                print(f"✅ Saved {len(chunks)} chunks to DB")
 
 
+    def search(self, search_mode: SearchMode, query: str, top_k: int = 5, min_score: float = 0.5, dimensions: int = 1536) -> list:
+        # generate embeddings for search query
+        query_embeddings = self.embeddings_client.get_embeddings(
+            input_texts = [query],
+            dimensions = dimensions
+        )
 
+        query_vector = str(query_embeddings[0])
 
-    #TODO:
-    # provide method `search` that will:
-    #   - apply search mode, user request, top k for search, min score threshold and dimensions
-    #   - generate embeddings from user request
-    #   - search in DB relevant context
-    #     hint 1: to search it in DB you need to create just regular select query
-    #     hint 2: Euclidean distance `<->`, Cosine distance `<=>`
-    #     hint 3: You need to extract `text` from `vectors` table
-    #     hint 4: You need to filter distance in WHERE clause
-    #     hint 5: To get top k use `limit`
+        if search_mode == SearchMode.EUCLIDIAN_DISTANCE:
+            distance_op = "<->"
+        else:
+            distance_op = "<=>"
+
+        # build search query
+        sql = f"""
+            SELECT text, embedding {distance_op} %s::vector AS distance
+            FROM vectors
+            WHERE embedding {distance_op} %s::vector < %s
+            ORDER BY distance
+            LIMIT %s
+        """
+
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory = RealDictCursor) as cursor:
+                cursor.execute(sql, (query_vector, query_vector, min_score, top_k))
+                results = cursor.fetchall()
+
+        print(f"🔍 Found {len(results)} relevant chunks")
+        return results
+
 
